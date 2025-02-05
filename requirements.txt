@@ -1,5 +1,5 @@
 python-dateutil
-signxml
+xmlsec
 requests
 lxml
 python-ldap
